@@ -1,96 +1,113 @@
-"""Citation verification.
-
-The model must return, for every claim, a chunk id and a quote copied from that chunk.
-We never trust that: each quote is located inside the chunk's real text (tolerant of
-whitespace, case and punctuation, and lightly tolerant of typos). Only quotes that are
-found become sources, and the snippet we return is the document's own text, not the
-model's copy of it. The match position also tells us the exact page.
-"""
-from __future__ import annotations
+# Checks the quotes Claude gives us actually exist in the documents.
+#
+# Claude returns {chunk_id, quote} for each citation. We look for the quote inside
+# that chunk's real text. If we can't find it, the citation is thrown away.
+# The snippet we return comes from the document itself, not from Claude.
 
 import re
 from difflib import SequenceMatcher
 
 MIN_QUOTE_CHARS = 6
-FUZZY_RATIO = 0.9
-SNIPPET_MAX = 400
+FUZZY_MIN_RATIO = 0.9  # allow small typos
+MAX_SNIPPET_CHARS = 400
 
 
-def _normalize(text: str) -> tuple[str, list[int]]:
-    """Lowercase alphanumerics only, plus a map from normalized index -> original index."""
-    chars, index = [], []
+def normalize_with_positions(text):
+    """Keep only letters/digits (lowercased). Also returns where each kept char
+    was in the original text so we can map a match back."""
+    chars = []
+    positions = []
     for i, ch in enumerate(text):
         if ch.isalnum():
             chars.append(ch.lower())
-            index.append(i)
-    return "".join(chars), index
+            positions.append(i)
+    return "".join(chars), positions
 
 
-def locate(quote: str, text: str) -> tuple[int, int] | None:
-    """Return (start, end) of the quote inside text in original coordinates, or None."""
-    qn, _ = _normalize(quote)
-    tn, idx = _normalize(text)
-    if len(qn) < MIN_QUOTE_CHARS or not tn:
+def locate(quote, text):
+    """Find quote in text, ignoring case/spaces/punctuation.
+    Returns (start, end) in the original text or None."""
+    q, _ = normalize_with_positions(quote)
+    t, positions = normalize_with_positions(text)
+    if len(q) < MIN_QUOTE_CHARS or not t:
         return None
-    pos = tn.find(qn)
-    if pos >= 0:
-        start, end = pos, pos + len(qn)
+
+    pos = t.find(q)
+    if pos != -1:
+        start = pos
+        end = pos + len(q)
     else:
-        m = SequenceMatcher(None, tn, qn, autojunk=False).find_longest_match(0, len(tn), 0, len(qn))
-        if m.size < min(20, len(qn)):
+        # no exact match, try fuzzy: find the longest common piece and check
+        # the area around it is close enough to the quote
+        m = SequenceMatcher(None, t, q, autojunk=False).find_longest_match(0, len(t), 0, len(q))
+        if m.size < min(20, len(q)):
             return None
         start = max(0, m.a - m.b)
-        end = min(len(tn), start + len(qn))
-        if SequenceMatcher(None, tn[start:end], qn, autojunk=False).ratio() < FUZZY_RATIO:
+        end = min(len(t), start + len(q))
+        ratio = SequenceMatcher(None, t[start:end], q, autojunk=False).ratio()
+        if ratio < FUZZY_MIN_RATIO:
             return None
-    return idx[start], idx[end - 1] + 1
+
+    return positions[start], positions[end - 1] + 1
 
 
-def page_at(chunk: dict, offset: int) -> int:
+def page_for_offset(chunk, offset):
     for span in chunk["spans"]:
-        if span["start"] <= offset < span["end"] + 1:
+        if span["start"] <= offset <= span["end"]:
             return span["page"]
     return chunk["pages"][0]
 
 
-def snippet(text: str, start: int, end: int) -> str:
-    """The located text, widened to whole lines so it reads naturally."""
+def make_snippet(text, start, end):
+    # expand to full lines so the snippet doesn't start mid word
     line_start = text.rfind("\n", 0, start) + 1
     line_end = text.find("\n", end)
-    line_end = len(text) if line_end < 0 else line_end
-    s = re.sub(r"\s+", " ", text[line_start:line_end]).strip()
-    if len(s) > SNIPPET_MAX:  # a long table row block etc: keep the quoted part
-        s = re.sub(r"\s+", " ", text[start:end]).strip()
-    return s
+    if line_end == -1:
+        line_end = len(text)
+    snippet = re.sub(r"\s+", " ", text[line_start:line_end]).strip()
+    if len(snippet) > MAX_SNIPPET_CHARS:
+        # too long (e.g. a whole table), just use the quoted part
+        snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+    return snippet
 
 
-def verify(citations: list[dict], chunks: dict[str, dict], documents: dict[str, dict]) -> tuple[list[dict], list[dict]]:
-    """Split model citations into (verified sources, rejected citations)."""
-    sources, rejected, seen = [], [], set()
+def verify(citations, chunks, documents):
+    """Returns (sources, rejected). sources = citations we could find in the docs."""
+    sources = []
+    rejected = []
+    seen = set()
+
     for cit in citations:
         chunk = chunks.get(cit.get("chunk_id", "").strip())
-        loc = locate(cit.get("quote", ""), chunk["text"]) if chunk else None
-        if not loc:
-            rejected.append({**cit, "reason": "unknown chunk id" if not chunk else "quote not found in chunk"})
+        if chunk is None:
+            rejected.append({**cit, "reason": "unknown chunk id"})
             continue
-        start, end = loc
-        page = page_at(chunk, start)
-        snip = snippet(chunk["text"], start, end)
-        key = (chunk["doc"], page, snip)
-        if key in seen:
+        found = locate(cit.get("quote", ""), chunk["text"])
+        if found is None:
+            rejected.append({**cit, "reason": "quote not found in chunk"})
+            continue
+
+        start, end = found
+        page = page_for_offset(chunk, start)
+        snippet = make_snippet(chunk["text"], start, end)
+
+        key = (chunk["doc"], page, snippet)
+        if key in seen:  # same quote cited twice
             continue
         seen.add(key)
+
         doc = documents[chunk["doc"]]
-        src = {
+        source = {
             "document": chunk["doc"],
             "location": f"page {page}",
-            "snippet": snip,
+            "snippet": snippet,
             "section": chunk["section"],
             "chunk_id": chunk["id"],
         }
         if doc["status"] == "superseded":
-            src["document_status"] = f"superseded by {doc['superseded_by']}"
+            source["document_status"] = f"superseded by {doc['superseded_by']}"
         if doc["ocr_pages"]:
-            src["extraction"] = "ocr"
-        sources.append(src)
+            source["extraction"] = "ocr"
+        sources.append(source)
+
     return sources, rejected

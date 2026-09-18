@@ -1,199 +1,214 @@
-"""Ingest every PDF in corpus/ and write data/index.json.
+# Builds data/index.json from the pdfs in corpus/
+# run with: python -m app.ingest
+#
+# What it does:
+# 1. pulls text out of each pdf (see pdf_extract.py)
+# 2. removes repeated boilerplate. The operations manual is 67 pages but almost
+#    everything is the same ~10 paragraphs over and over, so we keep one copy
+# 3. splits documents into sections using the numbered headings ("4. Annual Leave")
+# 4. marks old versions of a document as superseded (handbook 2024 vs 2025)
 
-    python -m app.ingest
-
-Steps
-  1. Extract positioned blocks per page (text layer, tables, or OCR for scans).
-  2. Collapse boilerplate: a paragraph repeated 3+ times inside the same document is
-     kept once, in a single "standard provisions" chunk, instead of 100 times.
-     (operations_manual_full.pdf is 67 pages; 982 of its 1,048 blocks are repeats.)
-  3. Split each document into sections on its numbered headings. A section is the
-     retrieval / citation unit; every character keeps its source page, so a citation
-     can point at the exact page even when a section spans a page break.
-  4. Detect document versions: documents sharing a title (e.g. the 2024 and 2025
-     employee handbooks) are grouped and all but the newest are marked superseded.
-"""
-from __future__ import annotations
-
-import collections
 import json
 import re
 import sys
 import time
-from pathlib import Path
+from collections import Counter
 
 from app.config import CORPUS_DIR, INDEX_PATH
-from app.pdf_extract import Block, SpaceRepairer, extract_pdf, text_layer_vocab
+from app.pdf_extract import Block, SpaceFixer, extract_pdf, get_known_words
 
-HEADING = re.compile(r"^(\d{1,2})\s*\.\s+\S.{0,70}$")
-SUBNUMBER = re.compile(r"^\d+\.\d+$")  # bare "10.1" labels in the operations manual
-BOILERPLATE_MIN_REPEATS = 3
+HEADING_RE = re.compile(r"^(\d{1,2})\s*\.\s+\S.{0,70}$")
+SUBNUMBER_RE = re.compile(r"^\d+\.\d+$")  # the bare "10.1" lines in the ops manual
+MIN_REPEATS = 3  # a paragraph showing up this many times in one doc is boilerplate
 MAX_SECTION_CHARS = 4000
 
 
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip().lower()
+def normalize(text):
+    return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def is_heading(b: Block) -> bool:
-    return b.kind != "table" and "\n" not in b.text and bool(HEADING.match(b.text))
+def is_heading(block):
+    if block.kind == "table" or "\n" in block.text:
+        return False
+    return HEADING_RE.match(block.text) is not None
 
 
-# --------------------------------------------------------------------------- versions
-def doc_year(meta_line: str, filename: str) -> int | None:
-    years = [int(y) for y in re.findall(r"\b(19\d\d|20\d\d)\b", meta_line)]
+def find_year(meta_line, filename):
+    years = re.findall(r"\b(19\d\d|20\d\d)\b", meta_line)
     if not years:
-        years = [int(y) for y in re.findall(r"(19\d\d|20\d\d)", filename)]
-    return max(years) if years else None
+        years = re.findall(r"(19\d\d|20\d\d)", filename)
+    if not years:
+        return None
+    return max(int(y) for y in years)
 
 
-def assign_versions(docs: list[dict]) -> None:
-    families = collections.defaultdict(list)
+def mark_versions(docs):
+    # docs with the same title are versions of each other, newest one wins
+    by_title = {}
     for d in docs:
-        families[norm(d["title"])].append(d)
-    for members in families.values():
-        for d in members:
-            d["status"], d["superseded_by"], d["other_versions"] = "current", None, []
-        if len(members) < 2:
+        d["status"] = "current"
+        d["superseded_by"] = None
+        d["other_versions"] = []
+        by_title.setdefault(normalize(d["title"]), []).append(d)
+
+    for versions in by_title.values():
+        if len(versions) < 2:
             continue
-        members.sort(key=lambda d: d["year"] or 0)
-        newest = members[-1]
-        for d in members:
-            d["other_versions"] = [m["file"] for m in members if m is not d]
-        for d in members[:-1]:
-            d["status"], d["superseded_by"] = "superseded", newest["file"]
+        versions.sort(key=lambda d: d["year"] or 0)
+        newest = versions[-1]
+        for d in versions:
+            d["other_versions"] = [v["file"] for v in versions if v is not d]
+            if d is not newest:
+                d["status"] = "superseded"
+                d["superseded_by"] = newest["file"]
 
 
-# --------------------------------------------------------------------------- chunks
-class ChunkBuilder:
-    """Accumulates blocks into one chunk while remembering which page each char came from."""
+class Chunk:
+    """Collects blocks for one section. Keeps track of which page each part
+    of the text came from so citations can point to the right page."""
 
-    def __init__(self, doc: str, section: str, kind: str = "section"):
-        self.doc, self.section, self.kind = doc, section, kind
-        self.parts: list[str] = []
-        self.spans: list[dict] = []
-        self.length = 0
+    def __init__(self, doc, section, kind="section"):
+        self.doc = doc
+        self.section = section
+        self.kind = kind
+        self.text = ""
+        self.spans = []  # [{start, end, page}] char offsets into self.text
 
-    def add(self, b: Block) -> None:
-        if self.parts:
-            self.parts.append("\n")
-            self.length += 1
-        self.spans.append({"start": self.length, "end": self.length + len(b.text), "page": b.page})
-        self.parts.append(b.text)
-        self.length += len(b.text)
+    def add(self, block):
+        if self.text:
+            self.text += "\n"
+        start = len(self.text)
+        self.text += block.text
+        self.spans.append({"start": start, "end": len(self.text), "page": block.page})
 
-    @property
-    def text(self) -> str:
-        return "".join(self.parts)
-
-    def to_dict(self, cid: str, **extra) -> dict:
-        pages = sorted({s["page"] for s in self.spans})
-        return {"id": cid, "doc": self.doc, "section": self.section, "kind": self.kind,
-                "text": self.text, "pages": pages, "spans": self.spans, **extra}
+    def to_dict(self, chunk_id):
+        pages = sorted(set(s["page"] for s in self.spans))
+        return {"id": chunk_id, "doc": self.doc, "section": self.section, "kind": self.kind,
+                "text": self.text, "pages": pages, "spans": self.spans}
 
 
-def build_document(path: Path, repairer: SpaceRepairer) -> tuple[dict, list[ChunkBuilder]]:
-    blocks, report = extract_pdf(str(path), repairer)
+def process_document(path, fixer):
+    blocks, report = extract_pdf(str(path), fixer)
 
-    # ---- boilerplate collapse (within this document only: identical text in two
-    # different documents, e.g. two handbook versions, is legitimately separate)
-    counts = collections.Counter(norm(b.text) for b in blocks if not is_heading(b))
-    repeated = {t for t, c in counts.items() if c >= BOILERPLATE_MIN_REPEATS and len(t) > 40}
-    boiler = ChunkBuilder(path.name, "Standard provisions repeated throughout this document", "boilerplate")
-    seen_boiler: set[str] = set()
-    boiler_pages: set[int] = set()
-    kept: list[Block] = []
+    # --- remove boilerplate ---
+    # only inside the same document, the two handbooks share a lot of text but
+    # that's on purpose (different versions) so we don't touch that
+    counts = Counter(normalize(b.text) for b in blocks if not is_heading(b))
+    repeated = set()
+    for text, count in counts.items():
+        if count >= MIN_REPEATS and len(text) > 40:
+            repeated.add(text)
+
+    boilerplate = Chunk(path.name, "Standard provisions repeated throughout this document", "boilerplate")
+    already_kept = set()
+    boilerplate_pages = set()
+    kept = []
     removed = 0
     for b in blocks:
-        t = norm(b.text)
-        if SUBNUMBER.match(b.text.strip()):
+        text = normalize(b.text)
+        if SUBNUMBER_RE.match(b.text.strip()):
             removed += 1
-            continue
-        if t in repeated:
-            boiler_pages.add(b.page)
-            if t not in seen_boiler:
-                seen_boiler.add(t)
-                boiler.add(b)
-            else:
+        elif text in repeated:
+            boilerplate_pages.add(b.page)
+            if text in already_kept:
                 removed += 1
-            continue
-        kept.append(b)
+            else:
+                already_kept.add(text)
+                boilerplate.add(b)
+        else:
+            kept.append(b)
 
     title = kept[0].text.split("\n")[0].strip() if kept else path.stem
     meta_line = kept[1].text.split("\n")[0].strip() if len(kept) > 1 else ""
 
-    # ---- sections
-    sections: list[ChunkBuilder] = [ChunkBuilder(path.name, "Document header")]
-    toc_page = None
+    # --- split into sections ---
+    sections = [Chunk(path.name, "Document header")]
+    contents_page = None
     for b in kept:
-        if norm(b.text) == "contents":
-            toc_page = b.page
-        in_toc = toc_page is not None and b.page == toc_page
-        if is_heading(b) and not in_toc:
-            sections.append(ChunkBuilder(path.name, b.text.strip()))
+        if normalize(b.text) == "contents":
+            contents_page = b.page
+        # the table of contents also looks like headings, ignore those
+        on_contents_page = contents_page is not None and b.page == contents_page
+        if is_heading(b) and not on_contents_page:
+            sections.append(Chunk(path.name, b.text.strip()))
         sections[-1].add(b)
-    # drop headings whose whole body was boilerplate (e.g. "13. Fleet Maintenance")
-    empty_sections = [s.section for s in sections if len(s.spans) <= 1 and s.section != "Document header"]
-    sections = [s for s in sections if len(s.spans) > 1 or s.section == "Document header"]
-    if seen_boiler:
-        sections.append(boiler)
 
-    # ---- split very long sections on block boundaries
-    final: list[ChunkBuilder] = []
+    # sections that were only boilerplate now just have their heading left
+    empty_sections = []
+    non_empty = []
     for s in sections:
-        if s.length <= MAX_SECTION_CHARS:
-            final.append(s)
-            continue
-        part = ChunkBuilder(s.doc, s.section, s.kind)
-        for span in s.spans:
-            blk = Block(text=s.text[span["start"]:span["end"]], page=span["page"], y=0)
-            if part.length + len(blk.text) > MAX_SECTION_CHARS and part.spans:
-                final.append(part)
-                part = ChunkBuilder(s.doc, s.section + " (cont.)", s.kind)
-            part.add(blk)
-        final.append(part)
+        if len(s.spans) <= 1 and s.section != "Document header":
+            empty_sections.append(s.section)
+        else:
+            non_empty.append(s)
+    sections = non_empty
+    if already_kept:
+        sections.append(boilerplate)
 
-    doc = {
+    # --- split sections that are too long ---
+    # (doesn't happen with this corpus but just in case)
+    chunks = []
+    for s in sections:
+        if len(s.text) <= MAX_SECTION_CHARS:
+            chunks.append(s)
+            continue
+        part = Chunk(s.doc, s.section, s.kind)
+        for span in s.spans:
+            block = Block(text=s.text[span["start"]:span["end"]], page=span["page"], y=0)
+            if part.spans and len(part.text) + len(block.text) > MAX_SECTION_CHARS:
+                chunks.append(part)
+                part = Chunk(s.doc, s.section + " (cont.)", s.kind)
+            part.add(block)
+        chunks.append(part)
+
+    ocr_conf = None
+    if report["ocr_pages"]:
+        ocr_conf = min(b.meta.get("ocr_min_confidence", 1.0) for b in blocks)
+
+    info = {
         "file": path.name,
         "title": title,
         "meta_line": meta_line,
-        "year": doc_year(meta_line, path.name),
+        "year": find_year(meta_line, path.name),
         "pages": report["pages"],
         "ocr_pages": report["ocr_pages"],
         "tables": report["tables"],
         "blocks_extracted": len(blocks),
         "blocks_removed_as_duplicates": removed,
-        "boilerplate_paragraphs": len(seen_boiler),
-        "boilerplate_pages": sorted(boiler_pages),
+        "boilerplate_paragraphs": len(already_kept),
+        "boilerplate_pages": sorted(boilerplate_pages),
         "sections_only_boilerplate": empty_sections,
-        "ocr_min_confidence": min((b.meta.get("ocr_min_confidence", 1.0) for b in blocks), default=None)
-        if report["ocr_pages"] else None,
+        "ocr_min_confidence": ocr_conf,
     }
-    return doc, final
+    return info, chunks
 
 
-def run(corpus_dir: Path = CORPUS_DIR, index_path: Path = INDEX_PATH) -> dict:
-    t0 = time.time()
+def run(corpus_dir=CORPUS_DIR, index_path=INDEX_PATH):
+    start = time.time()
     pdfs = sorted(corpus_dir.glob("*.pdf"))
     if not pdfs:
         sys.exit(f"No PDFs found in {corpus_dir}")
-    repairer = SpaceRepairer(text_layer_vocab([str(p) for p in pdfs]))
 
-    docs, chunks = [], []
-    for p in pdfs:
-        doc, builders = build_document(p, repairer)
-        ids = []
-        for b in builders:
-            cid = f"C{len(chunks) + 1:02d}"
-            chunks.append(b.to_dict(cid))
-            ids.append(cid)
-        doc["chunk_ids"] = ids
-        docs.append(doc)
-        extra = f" OCR pages {doc['ocr_pages']}" if doc["ocr_pages"] else ""
-        print(f"  {p.name:36s} pages={doc['pages']:3d} chunks={len(ids):2d} "
-              f"tables={doc['tables']} dup_removed={doc['blocks_removed_as_duplicates']}{extra}")
+    fixer = SpaceFixer(get_known_words(pdfs))
 
-    assign_versions(docs)
+    docs = []
+    all_chunks = []
+    for pdf in pdfs:
+        info, chunks = process_document(pdf, fixer)
+        info["chunk_ids"] = []
+        for c in chunks:
+            chunk_id = "C%02d" % (len(all_chunks) + 1)
+            all_chunks.append(c.to_dict(chunk_id))
+            info["chunk_ids"].append(chunk_id)
+        docs.append(info)
+
+        line = f"  {pdf.name:36s} pages={info['pages']:3d} chunks={len(chunks):2d} " \
+               f"tables={info['tables']} dup_removed={info['blocks_removed_as_duplicates']}"
+        if info["ocr_pages"]:
+            line += f" OCR pages {info['ocr_pages']}"
+        print(line)
+
+    mark_versions(docs)
     for d in docs:
         if d["status"] == "superseded":
             print(f"  {d['file']} is superseded by {d['superseded_by']}")
@@ -202,13 +217,15 @@ def run(corpus_dir: Path = CORPUS_DIR, index_path: Path = INDEX_PATH) -> dict:
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "corpus_files": {p.name: p.stat().st_mtime for p in pdfs},
         "documents": docs,
-        "chunks": chunks,
+        "chunks": all_chunks,
     }
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    index_path.write_text(json.dumps(index, indent=1, ensure_ascii=False), encoding="utf-8")
-    total_chars = sum(len(c["text"]) for c in chunks)
-    print(f"Indexed {len(docs)} documents, {len(chunks)} chunks, {total_chars:,} chars "
-          f"(~{total_chars // 4:,} tokens) in {time.time() - t0:.1f}s -> {index_path}")
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump(index, f, indent=1, ensure_ascii=False)
+
+    total = sum(len(c["text"]) for c in all_chunks)
+    print(f"Indexed {len(docs)} documents, {len(all_chunks)} chunks, {total:,} chars "
+          f"(~{total // 4:,} tokens) in {time.time() - start:.1f}s -> {index_path}")
     return index
 
 

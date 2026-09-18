@@ -1,7 +1,6 @@
-"""Offline tests: no API key or network needed. The model is replaced by a fake client."""
+# these tests don't call the real API, claude is replaced with a fake client
 import asyncio
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +13,7 @@ from app.retrieval import Index
 
 
 @pytest.fixture(scope="session")
-def index(tmp_path_factory) -> Index:
+def index(tmp_path_factory):
     path = config.INDEX_PATH
     if not path.exists():
         path = tmp_path_factory.mktemp("idx") / "index.json"
@@ -23,10 +22,13 @@ def index(tmp_path_factory) -> Index:
 
 
 def chunk(index, doc, section_startswith):
-    return next(c for c in index.chunks.values() if c["doc"] == doc and c["section"].startswith(section_startswith))
+    for c in index.chunks.values():
+        if c["doc"] == doc and c["section"].startswith(section_startswith):
+            return c
+    raise AssertionError(f"no section {section_startswith!r} in {doc}")
 
 
-# ------------------------------------------------------------------ ingestion
+# --- ingestion ---
 def test_scanned_vendor_agreement_is_ocrd_and_spaced(index):
     c = chunk(index, "vendor_agreement_scanned.pdf", "3. PAYMENT")
     assert "Net 45 days from the date of a correctly rendered invoice" in c["text"]
@@ -58,7 +60,7 @@ def test_full_context_fits_budget(index):
     assert index.full_context_tokens_estimate < config.FULL_CONTEXT_TOKEN_BUDGET
 
 
-# ------------------------------------------------------------------ citations
+# --- citations ---
 def test_locate_tolerates_whitespace_case_punctuation(index):
     c = chunk(index, "warehouse_safety_sop.pdf", "4. Incident")
     assert locate("step 3 complete incident form IR-01 within 24 hours of the event", c["text"])
@@ -83,7 +85,7 @@ def test_superseded_source_is_labelled(index):
     assert sources[0]["document_status"] == "superseded by employee_handbook_2025.pdf"
 
 
-# ------------------------------------------------------------------ retrieval mode
+# --- bm25 retrieval mode ---
 def test_bm25_finds_needle_and_pulls_other_version(index):
     ids = index.search("deadline for filing a damaged cargo claim", 3)
     assert chunk(index, "operations_manual_full.pdf", "10. Claims")["id"] in ids
@@ -92,7 +94,7 @@ def test_bm25_finds_needle_and_pulls_other_version(index):
     assert {"employee_handbook_2024.pdf", "employee_handbook_2025.pdf"} <= docs
 
 
-# ------------------------------------------------------------------ QA loop with a fake model
+# --- full question flow with a fake claude ---
 class FakeClient:
     def __init__(self, replies):
         self.replies, self.calls = list(replies), []

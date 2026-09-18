@@ -1,5 +1,4 @@
-"""Question -> grounded answer with verified sources."""
-from __future__ import annotations
+# Takes a question, asks Claude, checks the citations, returns the answer.
 
 import json
 import time
@@ -9,7 +8,6 @@ import anthropic
 
 from app import config
 from app.citations import verify
-from app.retrieval import Index
 
 INSTRUCTIONS = """You are the internal knowledge assistant for Meridian Logistics, a freight and \
 warehousing company in Pakistan. Staff ask you questions; you answer ONLY from the company \
@@ -79,102 +77,117 @@ class Usage:
     output_tokens: int = 0
     calls: int = 0
 
-    def add(self, u) -> None:
+    def add(self, u):
+        # cache fields can be None depending on the response
         self.input_tokens += u.input_tokens or 0
         self.cache_creation_input_tokens += getattr(u, "cache_creation_input_tokens", 0) or 0
         self.cache_read_input_tokens += getattr(u, "cache_read_input_tokens", 0) or 0
         self.output_tokens += u.output_tokens or 0
         self.calls += 1
 
-    def cost_usd(self, model: str) -> float:
-        p = config.PRICES.get(model)
-        if not p:
+    def cost_usd(self, model):
+        prices = config.PRICES.get(model)
+        if prices is None:
             return float("nan")
-        m = 1e-6
-        return round(
-            self.input_tokens * p["input"] * m
-            + self.cache_creation_input_tokens * p["input"] * config.CACHE_WRITE_MULT * m
-            + self.cache_read_input_tokens * p["input"] * config.CACHE_READ_MULT * m
-            + self.output_tokens * p["output"] * m,
-            6,
-        )
+        cost = (self.input_tokens * prices["input"]
+                + self.cache_creation_input_tokens * prices["input"] * config.CACHE_WRITE_MULT
+                + self.cache_read_input_tokens * prices["input"] * config.CACHE_READ_MULT
+                + self.output_tokens * prices["output"])
+        return round(cost / 1_000_000, 6)  # prices are per million tokens
 
 
 @dataclass
 class Answer:
     answer: str
-    sources: list[dict]
-    status: str
+    sources: list
+    status: str  # answered / not_found / unverified
     latency_ms: int = 0
     mode: str = ""
     model: str = ""
     usage: Usage = field(default_factory=Usage)
-    rejected_citations: list[dict] = field(default_factory=list)
+    rejected_citations: list = field(default_factory=list)
 
 
 class QAService:
-    def __init__(self, index: Index, client: anthropic.AsyncAnthropic | None = None,
-                 model: str = config.MODEL, mode: str = config.MODE):
+    def __init__(self, index, client=None, model=config.MODEL, mode=config.MODE):
         self.index = index
         self.client = client or anthropic.AsyncAnthropic(max_retries=2, timeout=30.0)
         self.model = model
+
         if mode == "auto":
-            mode = "full_context" if index.full_context_tokens_estimate <= config.FULL_CONTEXT_TOKEN_BUDGET else "retrieval"
+            if index.full_context_tokens_estimate <= config.FULL_CONTEXT_TOKEN_BUDGET:
+                mode = "full_context"
+            else:
+                mode = "retrieval"
         self.mode = mode
-        # Static, cacheable prefix: instructions + (in full_context mode) the whole corpus.
-        self.system_text = INSTRUCTIONS if mode == "retrieval" else INSTRUCTIONS + "\n\n" + index.full_context
 
-    def _model_kwargs(self) -> dict:
-        kw: dict = {"output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}}
+        # this part is the same for every question so it gets cached by the API
+        if mode == "retrieval":
+            self.system_text = INSTRUCTIONS
+        else:
+            self.system_text = INSTRUCTIONS + "\n\n" + index.full_context
+
+    def extra_params(self):
+        params = {"output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}}
+        # haiku 4.5 doesn't support effort/thinking settings, the bigger models do
         if not self.model.startswith("claude-haiku"):
-            # effort and thinking controls do not exist on Haiku 4.5
-            kw["output_config"]["effort"] = config.EFFORT
+            params["output_config"]["effort"] = config.EFFORT
             if config.EFFORT in ("low", "medium", "high"):
-                kw["thinking"] = {"type": "disabled"}  # latency budget: answer directly
-        return kw
+                params["thinking"] = {"type": "disabled"}  # thinking is too slow for the 4s target
+        return params
 
-    async def _call(self, messages: list[dict], usage: Usage) -> dict:
-        resp = await self.client.messages.create(
+    async def call_claude(self, messages, usage):
+        response = await self.client.messages.create(
             model=self.model,
             max_tokens=config.MAX_OUTPUT_TOKENS,
             system=[{"type": "text", "text": self.system_text, "cache_control": {"type": "ephemeral"}}],
             messages=messages,
-            **self._model_kwargs(),
+            **self.extra_params(),
         )
-        usage.add(resp.usage)
-        if resp.stop_reason == "refusal":
+        usage.add(response.usage)
+
+        if response.stop_reason == "refusal":
             return {"citations": [], "answer": "", "status": "not_found"}
-        text = next((b.text for b in resp.content if b.type == "text"), "")
+
+        text = ""
+        for block in response.content:
+            if block.type == "text":
+                text = block.text
+                break
         return json.loads(text)
 
-    def _user_message(self, question: str) -> str:
+    def build_user_message(self, question):
         if self.mode == "retrieval":
-            ids = self.index.search(question, config.RETRIEVAL_TOP_K)
-            return f"{self.index.render(ids)}\n\nQuestion: {question}"
-        return f"Question: {question}"
+            chunk_ids = self.index.search(question, config.RETRIEVAL_TOP_K)
+            return self.index.render(chunk_ids) + "\n\nQuestion: " + question
+        return "Question: " + question
 
-    async def ask(self, question: str) -> Answer:
-        t0 = time.perf_counter()
+    async def ask(self, question):
+        start = time.perf_counter()
         usage = Usage()
-        messages = [{"role": "user", "content": self._user_message(question)}]
-        out = await self._call(messages, usage)
-        sources, rejected = verify(out["citations"], self.index.chunks, self.index.documents)
+        messages = [{"role": "user", "content": self.build_user_message(question)}]
 
-        if out["status"] == "answered" and not sources:
-            # One corrective retry: tell the model which quotes failed verification.
-            messages += [
-                {"role": "assistant", "content": json.dumps(out)},
-                {"role": "user", "content": "None of your citations could be verified against the document text "
-                 f"({json.dumps(rejected)}). Copy quotes exactly from the chunk text, or set status to "
-                 "not_found if the documents do not support an answer."},
-            ]
-            out = await self._call(messages, usage)
-            sources, rejected2 = verify(out["citations"], self.index.chunks, self.index.documents)
-            rejected += rejected2
+        result = await self.call_claude(messages, usage)
+        sources, rejected = verify(result["citations"], self.index.chunks, self.index.documents)
 
-        status, answer = out["status"], out["answer"].strip()
+        # claude says it answered but none of the quotes are real -> give it one more try
+        if result["status"] == "answered" and not sources:
+            messages.append({"role": "assistant", "content": json.dumps(result)})
+            messages.append({"role": "user", "content":
+                             "None of your citations could be verified against the document text "
+                             f"({json.dumps(rejected)}). Copy quotes exactly from the chunk text, or set status to "
+                             "not_found if the documents do not support an answer."})
+            result = await self.call_claude(messages, usage)
+            sources, rejected_again = verify(result["citations"], self.index.chunks, self.index.documents)
+            rejected += rejected_again
+
+        status = result["status"]
+        answer = result["answer"].strip()
         if status == "answered" and not sources:
-            status, answer = "unverified", NOT_VERIFIED
-        return Answer(answer=answer, sources=sources, status=status,
-                      latency_ms=round((time.perf_counter() - t0) * 1000), mode=self.mode,
-                      model=self.model, usage=usage, rejected_citations=rejected)
+            # still nothing we can verify, don't return an answer without a source
+            status = "unverified"
+            answer = NOT_VERIFIED
+
+        latency_ms = round((time.perf_counter() - start) * 1000)
+        return Answer(answer=answer, sources=sources, status=status, latency_ms=latency_ms,
+                      mode=self.mode, model=self.model, usage=usage, rejected_citations=rejected)
