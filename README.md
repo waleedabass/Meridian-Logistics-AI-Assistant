@@ -79,33 +79,67 @@ If the model says "answered" but none of its citations verify, it gets one corre
 
 ### Model
 
-The default is **Claude Haiku 4.5** (`claude-haiku-4-5`). The task is grounded extraction over a small, cached context, with a hard p95 latency limit of 4 seconds. That favours the fastest model that answers these questions correctly. `MODEL=claude-sonnet-5` and `MODEL=claude-opus-5` are supported by setting an environment variable, run with low effort and thinking disabled to protect latency. The measured comparison is below.
+The default is **Claude Haiku 4.5** (`claude-haiku-4-5`). The task is grounded extraction over a small, cached context, with a hard p95 latency limit of 4 seconds. That favours the fastest model that answers these questions correctly. `MODEL=claude-sonnet-5` and `MODEL=claude-opus-5` are supported by setting an environment variable, run with low effort and thinking disabled to protect latency. I only ran the full evaluation on Haiku 4.5, so all numbers below are for Haiku.
 
 ## Results
 
-> **Pending.** The numbers in this section must come from a real run (`python run.py --repeat 3`). They are filled in from `eval/results.md` after that run and are not estimates.
+Measured with `python run.py --repeat 3` on 18 Sep 2026: 26 questions, 3 passes, 78 requests to the running service. Full per-question output is in `eval/results.md`, raw responses in `eval/results.json`.
 
-| | Haiku 4.5 | Sonnet 5 |
-|---|---|---|
-| Correct, graded against `eval/expected.json` | pending | pending |
-| Answers without a source | pending | pending |
-| Server latency p50 / p95 | pending | pending |
-| Cost per query, mean | pending | pending |
+| Metric | Result |
+|---|---|
+| Correct, first pass | 25 / 26 |
+| Correct, all passes | 76 / 78 |
+| Answers returned without a source | 0 |
+| Server latency p50 | 2,055 ms |
+| Server latency p95 | **4,571 ms (misses the 4,000 ms target)** |
+| Server latency max | 6,302 ms |
+| Cost per query, mean | **$0.00178** |
+| Cost per query, max | $0.00298 |
 
-Grading is automatic. `eval/expected.json` holds a key I wrote by reading the corpus by hand: required facts per question, the document a source must come from, and `not_found` for the five unanswerable questions.
+Grading is automatic. `eval/expected.json` is a key I wrote by reading the documents by hand. It lists the facts each answer must contain and which document a source must come from. For the five questions the documents can't answer, the expected result is `not_found`.
 
-### Cost per query: how the figure is derived
+The two failures are the same question, #16 ("most expensive per kg in the 2T-10T band"). On 2 of 3 runs the model said Islamabad-Gilgit at PKR 84,000, but Karachi-Islamabad is higher at PKR 88,500. So the table extraction is fine and the mistake is the model comparing numbers. A small calculator/lookup step would fix this (see "With two more days").
 
-Anthropic list prices per million tokens. Cache reads bill at 0.1x the input price. Cache writes bill at 1.25x the input price and happen once per 5 minutes of idle time.
+Latency: p95 is over the limit. The slowest answers are the long list answers (KYC documents, SLA sign-off steps, new clients), which write about 250 output tokens against a median of 99. Latency grows with answer length, not with the question.
 
-| Component | Tokens per query | Haiku 4.5 price | Cost |
+### Cost per query: how I got the number
+
+Model is Claude Haiku 4.5. Prices from Anthropic's pricing page, per million tokens:
+
+| Token type | Price per 1M tokens |
+|---|---|
+| Normal input | $1.00 |
+| Cache write (1.25 x input) | $1.25 |
+| Cache read (0.10 x input) | $0.10 |
+| Output | $5.00 |
+
+Formula (the service returns this as `cost_usd` on every response, see `Usage.cost_usd` in `app/qa.py`):
+
+```
+cost = input x $1.00/M + cache_write x $1.25/M + cache_read x $0.10/M + output x $5.00/M
+```
+
+Token counts are not estimated. They are the `usage` numbers the API returned, averaged over all 78 requests:
+
+| Part | Avg tokens per query | Price per 1M | Cost |
 |---|---|---|---|
-| Cached prefix read (instructions and corpus) | ~9,000 | $0.10 / M | $0.00090 |
-| Uncached input (the question) | ~30 | $1.00 / M | $0.00003 |
-| Output (citations and answer) | ~200 | $5.00 / M | $0.00100 |
-| **Total** | | | **about $0.002** |
+| Question text (not cached) | 25.4 | $1.00 | $0.0000254 |
+| Instructions + all documents, read from cache | 10,531 | $0.10 | $0.0010531 |
+| Cache write | 0 | $1.25 | $0.0000000 |
+| Answer + citations (output) | 139.4 | $5.00 | $0.0006970 |
+| **Total** | | | **$0.0017755** |
 
-The token counts in this table are estimates from character counts. The evaluation report replaces them with real `usage` figures from the API, and the service returns `cost_usd` on every response using the same formula. A cold cache write costs about $0.011 once, and the startup warm-up pays it before the first user arrives.
+That matches the measured average of $0.001775 per query. About 59% of the cost is reading the cached documents and 39% is the output.
+
+Notes on the numbers:
+
+- The cached prefix is 10,141 tokens. The average is a bit higher (10,531) because question #12 needed the citation retry on all 3 runs, so it read the prefix twice. That's also the most expensive query, $0.00298.
+- Cache writes show 0 because the server sends a warm-up question on startup, which pays the write before the evaluation starts. The cache stays alive as long as there's at least one question every 5 minutes (each read resets the timer).
+- The first question after the cache expires is the expensive one: 10,141 x $1.25/M = $0.0127 for the write, plus the normal question and output, about **$0.0134** for that one query.
+- Without prompt caching every query would pay full price for the 10,141 prefix tokens: about $0.0109 per query. Caching makes a normal query about 84% cheaper.
+- The whole evaluation (78 requests) cost $0.138, plus one cache write at startup.
+
+Rough example: 500 questions a day during office hours at $0.00178 each is about $0.89 a day, plus about $0.013 every time the cache goes cold after a gap of more than 5 minutes.
 
 ## What I tried, what I rejected
 
@@ -124,7 +158,8 @@ The token counts in this table are estimates from character counts. The evaluati
 - **The grader is keyword-based.** It checks required facts and source documents, not whether the prose is good. A correct answer phrased unexpectedly could fail, and a wrong one containing the keywords could pass.
 - **OCR confidence is recorded but not surfaced.** Answers from the scanned contract are flagged `"extraction": "ocr"` but do not carry a confidence warning.
 - **There is no authentication, rate limiting, or per-document access control.** A real deployment would need all three.
-- **Latency depends on a hosted API.** p95 is only as good as the provider's tail latency on the day of measurement.
+- **p95 latency misses the target.** Measured p95 is 4.6 s against the 4 s limit, driven by long list answers. It also depends on the API's speed on the day of measurement.
+- **Comparing numbers across a table is unreliable.** Question #16 picked the wrong route on 2 of 3 runs.
 
 ## With two more days
 
