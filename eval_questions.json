@@ -1,0 +1,31 @@
+{
+  "description": "Evaluation questions for the Meridian Logistics knowledge assistant. Run every question through your /ask endpoint and write the results to a file.",
+  "questions": [
+    { "id": 1,  "question": "How many days of annual leave do employees get?" },
+    { "id": 2,  "question": "What is the probation period for new employees?" },
+    { "id": 3,  "question": "How many days per week can employees work remotely?" },
+    { "id": 4,  "question": "What PPE is required in the warehouse?" },
+    { "id": 5,  "question": "What are the steps to report a safety incident?" },
+    { "id": 6,  "question": "Who is allowed to operate a forklift?" },
+    { "id": 7,  "question": "What KYC documents are needed to onboard a new client?" },
+    { "id": 8,  "question": "What is the SLA sign-off process?" },
+    { "id": 9,  "question": "What is the password policy?" },
+    { "id": 10, "question": "Is VPN required for remote access?" },
+    { "id": 11, "question": "What was revenue in Q3 2025?" },
+    { "id": 12, "question": "How many people does the company employ?" },
+    { "id": 13, "question": "Which new clients were won in Q3 2025?" },
+    { "id": 14, "question": "What is the policy on personal devices?" },
+    { "id": 15, "question": "What is the rate for a 1,200 kg shipment from Lahore to Karachi?" },
+    { "id": 16, "question": "Which route is most expensive per kg in the 2T-10T band?" },
+    { "id": 17, "question": "Is there a fuel surcharge on the Karachi-Quetta route?" },
+    { "id": 18, "question": "What are the payment terms in the vendor agreement?" },
+    { "id": 19, "question": "What is the deadline for filing a damaged cargo claim?" },
+    { "id": 20, "question": "Has the leave policy changed recently?" },
+    { "id": 21, "question": "What is the current probation period for new hires?" },
+    { "id": 22, "question": "What is the salary range for a warehouse supervisor?" },
+    { "id": 23, "question": "What does the company health insurance cover?" },
+    { "id": 24, "question": "What is the maternity leave policy?" },
+    { "id": 25, "question": "Who is the CEO of Meridian Logistics?" },
+    { "id": 26, "question": "What is the refund policy for delayed international shipments?" }
+  ]
+}

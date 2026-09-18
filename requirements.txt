@@ -1,0 +1,11 @@
+anthropic==1.6.0
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic==2.13.5
+python-dotenv==1.2.3
+httpx==0.28.1
+pymupdf==1.28.2
+rapidocr-onnxruntime==1.4.4
+wordninja==2.0.0
+numpy==2.4.6
+pytest==9.1.1
